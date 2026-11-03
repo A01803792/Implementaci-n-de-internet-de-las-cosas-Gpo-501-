@@ -1,16 +1,25 @@
-# Implementacion-de-internet-de-las-cosas-Gpo-501-
+# VitaLink
 
-## Integrantes
+Documentación del prototipo VitaLink para monitorear la salud.
 
-| Nombre | Matrícula |
-|---------|---------|
-| Omar Chávez Abarca | A01798554 |
-| Noel Rodríguez Rodríguez | A01803792 |
+## Información del proyecto
 
-Implementación de internet de las cosas
+- **Autores**:
+  - Omar Chávez Abarca (A01798554)
+  - Noel Rodríguez Rodríguez (A01803792)
+- **Profesores**:
+  - Benito Granados Rojas
+  - David Higuera Rosales
+  - Roberto Martínez Román
+  - Ariel Ortíz Ramírez
+- **Materia**: Implementación de internet de las cosas
+- **Grupo**: 501
+- **Escuela**: Tecnológico de Monterrey CEM
 
-Grupo 501
+## Estructura
 
-Prof. David Higuera Rosales
+- `/tests/`: archivos de pruebas de funcionamiento por sensor con ESP-32.
+- `/fase1.pdf`: primera versión del reporte.
+- `/fase2.pdf`: segunda versión del reporte.
+- `/README.md`: documentación.
 
-Tecnológico de Monterrey CEM
