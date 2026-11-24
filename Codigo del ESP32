@@ -1,0 +1,1070 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+#include <Wire.h>
+#include <math.h>
+#include <Adafruit_TMP117.h>
+#include <Adafruit_SHT4x.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <U8g2lib.h>
+
+// ==========================================
+// 1. CONFIGURACIÓN WI-FI, HORA MÉXICO Y MQTT
+// ==========================================
+const char* ssid        = "Tec-IoT";
+const char* password    = "spotless.magnetic.bridge";
+
+const char* mqtt_server = "135.148.238.50";
+const int   mqtt_port   = 1883;
+const char* mqtt_user   = "esp32";
+const char* mqtt_pass   = "esp32";
+
+// Endpoints Base de Datos (JSON cada 1.5 min y Alarmas inmediatas)
+const char* TOPIC_MEDICION = "vitalink/recv";
+const char* TOPIC_ALARMA   = "vitalink/alarm";
+
+// Endpoints Live Monitor (Datos crudos cada 1 segundo, sin guardar en ESP)
+const char* TOPIC_LIVE_TEMP  = "vitalink/temperature";
+const char* TOPIC_LIVE_BPM   = "vitalink/bpm";
+const char* TOPIC_LIVE_SPO2  = "vitalink/spo2";
+const char* TOPIC_LIVE_STEPS = "vitalink/steps";
+
+// Zona horaria Centro de México (UTC-6 permanente = -21600 segundos)
+const long GMT_OFFSET_MEXICO_SEC = -21600;
+const int  DAYLIGHT_OFFSET_SEC   = 0;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+unsigned long lastMqttReconnect = 0;
+
+// ==========================================
+// 2. PINES DE COMUNICACIÓN (BUSES SEPARADOS)
+// ==========================================
+// Bus 1: I2C Hardware para los 4 sensores
+const int PIN_SDA  = 4;
+const int PIN_SCL  = 5;
+const int MPU_ADDR = 0x68;
+
+// Bus 2: I2C Software para la pantalla OLED
+const int OLED_SDA = 0; 
+const int OLED_SCL = 1;
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+
+// Instancias de sensores
+Adafruit_TMP117 tmp117;
+Adafruit_SHT4x sht40 = Adafruit_SHT4x();
+MAX30105 particleSensor;
+
+// ==========================================
+// 3. IDs DE SENSORES, TIEMPOS Y UMBRALES
+// ==========================================
+const unsigned long DB_SEND_INTERVAL = 90000; // 1 minuto y medio (90,000 ms)
+const float HUMEDAD_ACTIVACION = 55.0;        // < 55% apaga los demás sensores
+
+// IDs oficiales según tabla de endpoints BD (SHT40 no se envía)
+const int ID_SENSOR_TMP  = 1; // TMP117 (°C)
+const int ID_SENSOR_BPM  = 2; // MAX30102 (BPM)
+const int ID_SENSOR_SPO2 = 3; // MAX30102 (SpO2)
+const int ID_SENSOR_MPU  = 4; // MPU6050 (Pasos acumulados / Caídas)
+
+// Escala de severidad de alarmas (1 a 5)
+const int SEV_CAIDA          = 2;
+const int SEV_VIGILANCIA     = 3;
+const int SEV_HIPOTERMIA     = 4;
+const int SEV_FIEBRE         = 4;
+const int SEV_PULSO_BAJO     = 4;
+const int SEV_OXIGENO_BAJO   = 5;
+const int SEV_FIEBRE_CRITICA = 5;
+
+// Umbrales MAX30102
+const int BPM_MIN_ALERTA  = 50;
+const int SPO2_MIN_ALERTA = 90;
+
+// Umbrales Temperatura en Muñeca (°C) - Calibrados a piel periférica
+const float TEMP_HIPOTERMIA = 30.5;  // < 30.5 °C -> Hipotermia (equiv. < 35.0 °C central)
+const float TEMP_VIGILANCIA = 34.8;  // 34.8 a 35.19 °C -> Vigilancia (equiv. 37.8 °C central)
+const float TEMP_FIEBRE     = 35.2;  // >= 35.2 °C -> Fiebre (equiv. >= 38.0 °C central)
+const float TEMP_EMERGENCIA = 37.2;  // > 37.2 °C -> Emergencia médica (equiv. > 40.0 °C central)
+const float TEMP_HISTERESIS = 0.20;  // Margen para evitar disparos repetidos en el borde
+const float TEMP_OFFSET     = 0.0;
+
+// ==========================================
+// 4. BÚFER EN RAM SOLO PARA BD (MÁXIMO 3 CICLOS)
+// ==========================================
+const uint8_t MAX_CICLOS_MEMORIA = 3;
+uint8_t ciclosGuardados = 0;
+
+struct MensajeMQTT {
+  bool esAlarma;
+  int idSensor;
+  String payload;
+};
+
+#define MAX_COLA_JSON 20
+MensajeMQTT colaJson[MAX_COLA_JSON];
+uint8_t totalEnCola = 0;
+
+String ultimoPayloadMedicion[5] = {"", "", "", "", ""};
+String ultimaAlarmaEnviada = "";
+
+// ==========================================
+// 5. VARIABLES DE SENSORES Y ACUMULADORES
+// ==========================================
+bool lowPowerMode = false;
+
+// Acumuladores que se reinician cada 1.5 minutos
+float sumBodyTemp = 0.0;
+float sumAmbientTemp = 0.0;
+float sumHumidity = 0.0;
+unsigned int envSamples = 0;
+
+unsigned long sumBpm = 0;
+unsigned int bpmSamples = 0;
+
+unsigned long sumSpo2 = 0;
+unsigned int spo2Samples = 0;
+
+// --- MPU6050 (Muñeca): stepCount NO se reinicia, suma continuo ---
+unsigned long stepCount = 0;
+unsigned int fallCount = 0;
+bool fallAlertActive = false;
+bool stepFlag = false;
+unsigned long lastStepTime = 0;
+
+enum FallState { NORMAL, FREE_FALL, IMPACT_DETECTED };
+FallState currentFallState = NORMAL;
+unsigned long fallStateTimestamp = 0;
+
+// --- MAX30102 (No bloqueante) ---
+#define BUFFER_SIZE 100
+uint32_t redBuffer[BUFFER_SIZE];
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t newRed[25];
+uint32_t newIR[25];
+byte samplesInBuffer = 0;
+byte newSampleCount = 0;
+
+int32_t spo2 = 0, heartRate = 0;
+int8_t validSPO2 = 0, validHeartRate = 0;
+bool fingerDetected = false;
+bool lowBpmAlert = false;
+bool lowSpo2Alert = false;
+uint8_t lowBpmStreak = 0;
+uint8_t lowSpo2Streak = 0;
+
+// --- Temperatura y Humedad ---
+enum TempStatus {
+  TEMP_HIPOTERMIA_STATE,
+  TEMP_NORMAL_STATE,
+  TEMP_VIGILANCIA_STATE,
+  TEMP_FIEBRE_STATE,
+  TEMP_EMERGENCIA_STATE
+};
+TempStatus currentTempState = TEMP_NORMAL_STATE;
+TempStatus prevTempState = TEMP_NORMAL_STATE;
+float bodyTemp = 0.0;
+float ambientTemp = 0.0;
+float ambientHumidity = 0.0;
+
+// Temporizadores
+unsigned long lastMpuSample = 0;
+unsigned long lastSlowPoll = 0;    // Muestreo interno, OLED y LIVE cada 1s
+unsigned long lastSleepCheck = 0;  // Revisión de humedad en ahorro cada 2s
+unsigned long lastDbSendTime = 0;  // Envío a BD cada 90s
+
+// ==========================================
+// 6. GESTIÓN DE HORA MÉXICO, LIVE Y MQTT BD
+// ==========================================
+String obtenerFechaHoraMexico() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 50)) {
+    char bufferFecha[25];
+    strftime(bufferFecha, sizeof(bufferFecha), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(bufferFecha);
+  }
+
+  unsigned long totalSeg = millis() / 1000;
+  unsigned int seg  = totalSeg % 60;
+  unsigned int min  = (39 + (totalSeg / 60)) % 60;
+  unsigned int hora = (12 + ((39 + (totalSeg / 60)) / 60)) % 24;
+  char buf[25];
+  snprintf(buf, sizeof(buf), "2026-11-23 %02u:%02u:%02u", hora, min, seg);
+  return String(buf);
+}
+
+String obtenerHoraCortaMexico() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 20)) {
+    char bufferHora[10];
+    strftime(bufferHora, sizeof(bufferHora), "%H:%M", &timeinfo);
+    return String(bufferHora);
+  }
+  return "--:--";
+}
+
+// --- ENVÍO EN VIVO CADA 1 SEGUNDO (SIN GUARDAR EN MEMORIA DEL ESP) ---
+void enviarDatosLive() {
+  if (lowPowerMode) return;
+  if (WiFi.status() != WL_CONNECTED || !client.connected()) return;
+
+  int liveBpm  = (fingerDetected && validHeartRate && heartRate >= 30 && heartRate < 180) ? heartRate : 0;
+  int liveSpo2 = (fingerDetected && validSPO2 && spo2 > 70 && spo2 <= 100) ? spo2 : 0;
+
+  char bufTemp[12];
+  char bufSteps[16];
+  snprintf(bufTemp,  sizeof(bufTemp),  "%.1f", bodyTemp);
+  snprintf(bufSteps, sizeof(bufSteps), "%lu",  stepCount);
+
+  // Temperatura y pasos se envían cada segundo
+  client.publish(TOPIC_LIVE_TEMP,  bufTemp,  false);
+  client.publish(TOPIC_LIVE_STEPS, bufSteps, false);
+
+  // BPM y SpO2 solo se envían si son mayores a 0
+  if (liveBpm > 0) {
+    char bufBpm[12];
+    snprintf(bufBpm, sizeof(bufBpm), "%d", liveBpm);
+    client.publish(TOPIC_LIVE_BPM, bufBpm, false);
+  }
+
+  if (liveSpo2 > 0) {
+    char bufSpo2[12];
+    snprintf(bufSpo2, sizeof(bufSpo2), "%d", liveSpo2);
+    client.publish(TOPIC_LIVE_SPO2, bufSpo2, false);
+  }
+
+  client.loop();
+
+  Serial.print("⚡ [LIVE] Temp: "); Serial.print(bufTemp);
+  Serial.print(" | BPM: ");        Serial.print(liveBpm > 0 ? String(liveBpm) : "--");
+  Serial.print(" | SpO2: ");       Serial.print(liveSpo2 > 0 ? String(liveSpo2) : "--");
+  Serial.print(" | Pasos: ");      Serial.println(bufSteps);
+}
+
+void limpiarColaMemoria() {
+  for (uint8_t i = 0; i < MAX_COLA_JSON; i++) {
+    colaJson[i].payload = "";
+    colaJson[i].idSensor = 0;
+    colaJson[i].esAlarma = false;
+  }
+  totalEnCola = 0;
+  ciclosGuardados = 0;
+}
+
+bool existeEnCola(const String& payload) {
+  for (uint8_t i = 0; i < totalEnCola; i++) {
+    if (colaJson[i].payload == payload) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void despacharJsonMQTT(bool esAlarma, int idSensor, const String& payload) {
+  const char* destino = esAlarma ? TOPIC_ALARMA : TOPIC_MEDICION;
+
+  if (esAlarma) {
+    if (payload == ultimaAlarmaEnviada) {
+      Serial.println("⏭ [MQTT BD] Alarma duplicada omitida.");
+      return;
+    }
+  } else if (idSensor >= 1 && idSensor <= 4) {
+    if (payload == ultimoPayloadMedicion[idSensor]) {
+      Serial.print("⏭ [MQTT BD] Medición duplicada omitida para sensor ");
+      Serial.println(idSensor);
+      return;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && client.connected()) {
+    Serial.print("📤 [MQTT BD -> ");
+    Serial.print(destino);
+    Serial.print("] ");
+    Serial.print(payload);
+
+    bool ok = client.publish(destino, payload.c_str(), false);
+    client.loop();
+
+    if (ok) {
+      Serial.println("  --> ✔ ENVIADO OK");
+      if (esAlarma) {
+        ultimaAlarmaEnviada = payload;
+      } else if (idSensor >= 1 && idSensor <= 4) {
+        ultimoPayloadMedicion[idSensor] = payload;
+      }
+    } else {
+      Serial.print("  --> ❌ ERROR AL PUBLICAR (rc=");
+      Serial.print(client.state());
+      Serial.println(")");
+    }
+    return;
+  }
+
+  if (!existeEnCola(payload) && totalEnCola < MAX_COLA_JSON) {
+    colaJson[totalEnCola].esAlarma = esAlarma;
+    colaJson[totalEnCola].idSensor = idSensor;
+    colaJson[totalEnCola].payload  = payload;
+    totalEnCola++;
+
+    Serial.print("💾 [SIN RED - EN COLA #");
+    Serial.print(totalEnCola);
+    Serial.print(" -> ");
+    Serial.print(destino);
+    Serial.print("] ");
+    Serial.println(payload);
+  }
+}
+
+void vaciarColaPendiente() {
+  if (totalEnCola == 0 || !client.connected()) return;
+
+  Serial.print("🔄 Enviando ");
+  Serial.print(totalEnCola);
+  Serial.println(" mensajes BD pendientes en cola...");
+
+  for (uint8_t i = 0; i < totalEnCola; i++) {
+    const char* destino = colaJson[i].esAlarma ? TOPIC_ALARMA : TOPIC_MEDICION;
+    Serial.print("   📤 [COLA -> ");
+    Serial.print(destino);
+    Serial.print("] ");
+    Serial.print(colaJson[i].payload);
+
+    if (client.publish(destino, colaJson[i].payload.c_str(), false)) {
+      Serial.println("  --> ✔ ENVIADO OK");
+      if (colaJson[i].esAlarma) {
+        ultimaAlarmaEnviada = colaJson[i].payload;
+      } else if (colaJson[i].idSensor >= 1 && colaJson[i].idSensor <= 4) {
+        ultimoPayloadMedicion[colaJson[i].idSensor] = colaJson[i].payload;
+      }
+    } else {
+      Serial.println("  --> ❌ FALLÓ");
+    }
+    client.loop();
+  }
+  limpiarColaMemoria();
+}
+
+void mantenerConexionMQTT(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!client.connected()) {
+    if (now - lastMqttReconnect >= 5000) {
+      lastMqttReconnect = now;
+      String clientId = "ESP32C3_VitaLink_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+      Serial.print("🔌 Conectando a servidor MQTT (");
+      Serial.print(mqtt_server);
+      Serial.print(")...");
+
+      if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+        Serial.println(" ✔ CONECTADO!");
+        vaciarColaPendiente();
+      } else {
+        Serial.print(" ❌ Falló (rc=");
+        Serial.print(client.state());
+        Serial.println("), reintentando en 5s.");
+      }
+    }
+  } else {
+    client.loop();
+  }
+}
+
+void enviarMedicionJSON(int idSensor, const String& fechaStr, float valor) {
+  String json = "{";
+  json += "\"sensor\":" + String(idSensor) + ",";
+  json += "\"fecha\":\"" + fechaStr + "\",";
+  json += "\"valor\":" + String(valor, 2);
+  json += "}";
+
+  despacharJsonMQTT(false, idSensor, json);
+}
+
+void enviarAlarmaJSON(int idSensor, const String& fechaStr, int severidad, const char* descripcion) {
+  String json = "{";
+  json += "\"sensor\":" + String(idSensor) + ",";
+  json += "\"fecha\":\"" + fechaStr + "\",";
+  json += "\"severidad\":" + String(severidad) + ",";
+  json += "\"descripcion\":\"" + String(descripcion) + "\"";
+  json += "}";
+
+  despacharJsonMQTT(true, idSensor, json);
+}
+
+// ==========================================
+// 7. INTERFAZ GRÁFICA PANTALLA OLED
+// ==========================================
+void dibujarCaritaFeliz(int cx, int cy, int r) {
+  u8g2.drawCircle(cx, cy, r);
+  u8g2.drawDisc(cx - 5, cy - 4, 2);
+  u8g2.drawDisc(cx + 5, cy - 4, 2);
+
+  for (int angle = 25; angle <= 155; angle += 5) {
+    float rad = angle * PI / 180.0;
+    int sx = cx + (int)(cos(rad) * (r - 5));
+    int sy = cy + 1 + (int)(sin(rad) * (r - 5));
+    u8g2.drawPixel(sx, sy);
+    u8g2.drawPixel(sx, sy + 1);
+  }
+}
+
+void dibujarSimboloAlerta() {
+  u8g2.setDrawColor(1);
+  u8g2.drawDisc(22, 15, 6);
+  u8g2.drawBox(16, 15, 13, 32);
+  u8g2.drawDisc(15, 48, 8);
+  u8g2.drawDisc(29, 48, 8);
+
+  u8g2.setDrawColor(0);
+  u8g2.drawLine(16, 19, 28, 19);
+  u8g2.drawLine(22, 9, 22, 12);
+  u8g2.drawLine(22, 47, 22, 56);
+  u8g2.setDrawColor(1);
+}
+
+void mostrarVistaNormal() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  dibujarCaritaFeliz(21, 21, 15);
+  u8g2.setCursor(15, 40);
+  u8g2.print("OK");
+  u8g2.setCursor(7, 52);
+  u8g2.print(obtenerHoraCortaMexico());
+
+  u8g2.drawLine(44, 0, 44, 63);
+
+  u8g2.setCursor(48, 3);
+  u8g2.print("Mov: ");
+  u8g2.print(stepCount);
+
+  u8g2.setCursor(48, 19);
+  u8g2.print("Oxi: ");
+  if (fingerDetected && validSPO2 && spo2 > 70 && spo2 <= 100) {
+    u8g2.print(spo2);
+    u8g2.print("%");
+  } else {
+    u8g2.print("--");
+  }
+
+  u8g2.setCursor(48, 35);
+  u8g2.print("Lat: ");
+  if (fingerDetected && validHeartRate && heartRate >= 30 && heartRate < 180) {
+    u8g2.print(heartRate);
+    u8g2.print("bpm");
+  } else {
+    u8g2.print("--");
+  }
+
+  u8g2.setCursor(48, 51);
+  u8g2.print("Tmp: ");
+  u8g2.print(bodyTemp, 1);
+  u8g2.print("C");
+
+  u8g2.sendBuffer();
+}
+
+void mostrarVistaAlerta() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  dibujarSimboloAlerta();
+  u8g2.drawLine(46, 0, 46, 63);
+
+  u8g2.drawBox(49, 0, 79, 11);
+  u8g2.setDrawColor(0);
+  u8g2.setCursor(64, 2);
+  u8g2.print("ALERTA!");
+  u8g2.setDrawColor(1);
+
+  int yPos = 18;
+
+  if (fallAlertActive && yPos <= 50) {
+    u8g2.setCursor(50, yPos);
+    u8g2.print("CAIDA!");
+    yPos += 16;
+  }
+
+  if (lowBpmAlert && yPos <= 50) {
+    u8g2.setCursor(50, yPos);
+    u8g2.print("PULSO:");
+    u8g2.print(heartRate);
+    yPos += 16;
+  }
+
+  if (lowSpo2Alert && yPos <= 50) {
+    u8g2.setCursor(50, yPos);
+    u8g2.print("SPO2:");
+    u8g2.print(spo2);
+    u8g2.print("%");
+    yPos += 16;
+  }
+
+  if (currentTempState != TEMP_NORMAL_STATE && yPos <= 50) {
+    u8g2.setCursor(50, yPos);
+    switch (currentTempState) {
+      case TEMP_HIPOTERMIA_STATE: u8g2.print("HIPOTERMIA"); break;
+      case TEMP_VIGILANCIA_STATE: u8g2.print("VIGILANCIA"); break;
+      case TEMP_FIEBRE_STATE:     u8g2.print("FIEBRE!");    break;
+      case TEMP_EMERGENCIA_STATE: u8g2.print("EMERGENCIA"); break;
+      default: break;
+    }
+    yPos += 16;
+
+    if (yPos <= 50) {
+      u8g2.setCursor(50, yPos);
+      u8g2.print("TMP:");
+      u8g2.print(bodyTemp, 1);
+      u8g2.print("C");
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
+void actualizarPantalla() {
+  if (lowPowerMode) return;
+
+  bool hayAlerta = fallAlertActive || lowBpmAlert || lowSpo2Alert || (currentTempState != TEMP_NORMAL_STATE);
+  if (hayAlerta) {
+    mostrarVistaAlerta();
+  } else {
+    mostrarVistaNormal();
+  }
+}
+
+// ==========================================
+// 8. GESTIÓN DE PROMEDIOS Y ENVÍO A BD (1.5 MIN)
+// ==========================================
+void resetAccumulators() {
+  sumBodyTemp = 0.0;
+  sumAmbientTemp = 0.0;
+  sumHumidity = 0.0;
+  envSamples = 0;
+
+  sumBpm = 0;
+  bpmSamples = 0;
+
+  sumSpo2 = 0;
+  spo2Samples = 0;
+}
+
+void registrarEventoBD(int idSensorOrigen, float valorAlarma, int severidad, const char* motivo, bool esAlarma) {
+  if (ciclosGuardados >= MAX_CICLOS_MEMORIA) {
+    limpiarColaMemoria();
+  }
+
+  String fechaMexico = obtenerFechaHoraMexico();
+
+  if (esAlarma) {
+    Serial.println("\n================ 🚨 ALARMA DETECTADA ================");
+    enviarMedicionJSON(idSensorOrigen, fechaMexico, valorAlarma);
+    enviarAlarmaJSON(idSensorOrigen, fechaMexico, severidad, motivo);
+    Serial.println("=====================================================\n");
+
+    actualizarPantalla();
+  } else {
+    float outBodyTemp = (envSamples > 0) ? (sumBodyTemp / envSamples) : bodyTemp;
+
+    int outBpm = -1;
+    if (bpmSamples > 0) {
+      outBpm = sumBpm / bpmSamples;
+    } else if (fingerDetected && validHeartRate && heartRate >= 30 && heartRate < 180) {
+      outBpm = heartRate;
+    }
+
+    int outSpo2 = -1;
+    if (spo2Samples > 0) {
+      outSpo2 = sumSpo2 / spo2Samples;
+    } else if (fingerDetected && validSPO2 && spo2 > 70 && spo2 <= 100) {
+      outSpo2 = spo2;
+    }
+
+    Serial.println("\n---------------- 📡 ENVÍO PERIÓDICO BD (1.5 MIN) ----------------");
+    enviarMedicionJSON(ID_SENSOR_TMP, fechaMexico, outBodyTemp);
+
+    if (outBpm != -1) {
+      enviarMedicionJSON(ID_SENSOR_BPM, fechaMexico, (float)outBpm);
+    }
+
+    if (outSpo2 != -1) {
+      enviarMedicionJSON(ID_SENSOR_SPO2, fechaMexico, (float)outSpo2);
+    }
+
+    enviarMedicionJSON(ID_SENSOR_MPU, fechaMexico, (float)stepCount);
+    Serial.println("-----------------------------------------------------------------\n");
+
+    ciclosGuardados++;
+    resetAccumulators();
+    lastDbSendTime = millis();
+  }
+}
+
+// ==========================================
+// 9. FUNCIONES DE AHORRO DE ENERGÍA
+// ==========================================
+void enterLowPowerMode() {
+  if (lowPowerMode) return;
+  lowPowerMode = true;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x40);
+  Wire.endTransmission();
+
+  particleSensor.shutDown();
+  tmp117.setMeasurementMode(TMP117_MODE_SHUTDOWN);
+
+  // Mostrar aviso breve en OLED antes de apagarla para confirmar que enciende
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setCursor(10, 20);
+  u8g2.print("Modo ahorro activo");
+  u8g2.setCursor(10, 36);
+  u8g2.print("Humedad: ");
+  u8g2.print(ambientHumidity, 0);
+  u8g2.print("% (<55%)");
+  u8g2.sendBuffer();
+  delay(1500);
+
+  u8g2.setPowerSave(1);
+
+  currentFallState = NORMAL;
+  fallAlertActive = false;
+  lowBpmAlert = false;
+  lowSpo2Alert = false;
+  lowBpmStreak = 0;
+  lowSpo2Streak = 0;
+  currentTempState = TEMP_NORMAL_STATE;
+  prevTempState = TEMP_NORMAL_STATE;
+  resetAccumulators();
+
+  Serial.println("\n💤 HUMEDAD < 55%: Modo ahorro activado. Solo SHT40 activo...\n");
+}
+
+void exitLowPowerMode() {
+  if (!lowPowerMode) return;
+  lowPowerMode = false;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1B);
+  Wire.write(0x08);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x10);
+  Wire.endTransmission();
+
+  particleSensor.wakeUp();
+  samplesInBuffer = 0;
+  newSampleCount = 0;
+
+  tmp117.setMeasurementMode(TMP117_MODE_CONTINUOUS);
+  sensors_event_t temp_tmp;
+  if (tmp117.getEvent(&temp_tmp)) {
+    bodyTemp = temp_tmp.temperature + TEMP_OFFSET;
+  }
+
+  u8g2.setPowerSave(0);
+  actualizarPantalla();
+
+  resetAccumulators();
+  unsigned long now = millis();
+  lastMpuSample = now;
+  lastSlowPoll = now;
+  lastDbSendTime = now;
+
+  Serial.println("\n⚡ HUMEDAD >= 55%: Sensores reactivados.\n");
+}
+
+// ==========================================
+// 10. PROCESAMIENTO DE SENSORES
+// ==========================================
+void actualizarMPU(unsigned long now) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+  if (Wire.available() == 14) {
+    int16_t rawAcX = (Wire.read() << 8) | Wire.read();
+    int16_t rawAcY = (Wire.read() << 8) | Wire.read();
+    int16_t rawAcZ = (Wire.read() << 8) | Wire.read();
+    Wire.read(); Wire.read();
+    int16_t rawGyX = (Wire.read() << 8) | Wire.read();
+    int16_t rawGyY = (Wire.read() << 8) | Wire.read();
+    int16_t rawGyZ = (Wire.read() << 8) | Wire.read();
+
+    float ax = rawAcX / 4096.0;
+    float ay = rawAcY / 4096.0;
+    float az = rawAcZ / 4096.0;
+    float gx = rawGyX / 65.5;
+    float gy = rawGyY / 65.5;
+    float gz = rawGyZ / 65.5;
+
+    float totalG = sqrt(ax * ax + ay * ay + az * az);
+    float gyroMag = sqrt(gx * gx + gy * gy + gz * gz);
+
+    // Conteo acumulativo de pasos
+    if (totalG > 1.30 && !stepFlag && (now - lastStepTime > 320)) {
+      stepCount++;
+      stepFlag = true;
+      lastStepTime = now;
+    } else if (totalG < 1.10) {
+      stepFlag = false;
+    }
+
+    // Detección de caídas -> ID 4 (MPU6050), Severidad 2
+    switch (currentFallState) {
+      case NORMAL:
+        if (totalG < 0.45) {
+          currentFallState = FREE_FALL;
+          fallStateTimestamp = now;
+        }
+        break;
+
+      case FREE_FALL:
+        if (totalG > 2.4) {
+          currentFallState = IMPACT_DETECTED;
+          fallStateTimestamp = now;
+        } else if (now - fallStateTimestamp > 600) {
+          currentFallState = NORMAL;
+        }
+        break;
+
+      case IMPACT_DETECTED:
+        if (now - fallStateTimestamp >= 1500) {
+          bool munecaQuieta = (gyroMag < 35.0) && (abs(totalG - 1.0) < 0.20);
+          if (munecaQuieta && !fallAlertActive) {
+            fallAlertActive = true;
+            fallCount++;
+            registrarEventoBD(ID_SENSOR_MPU, totalG, SEV_CAIDA, "Caida detectada en muneca", true);
+          }
+          currentFallState = NORMAL;
+        }
+        break;
+    }
+
+    if (fallAlertActive && gyroMag > 90.0) {
+      fallAlertActive = false;
+    }
+  }
+}
+
+void evaluarAlertasOximetro() {
+  fingerDetected = (irBuffer[BUFFER_SIZE - 1] >= 50000);
+
+  if (!fingerDetected) {
+    lowBpmAlert = false;
+    lowSpo2Alert = false;
+    lowBpmStreak = 0;
+    lowSpo2Streak = 0;
+    return;
+  }
+
+  // Evaluar latidos bajos -> ID 2 (BPM), Severidad 4
+  if (validHeartRate && heartRate >= 30 && heartRate < 180) {
+    if (heartRate < BPM_MIN_ALERTA) {
+      if (lowBpmStreak < 3) lowBpmStreak++;
+      if (lowBpmStreak >= 3 && !lowBpmAlert) {
+        lowBpmAlert = true;
+        registrarEventoBD(ID_SENSOR_BPM, (float)heartRate, SEV_PULSO_BAJO, "Ritmo cardiaco bajo (< 50 BPM)", true);
+      }
+    } else {
+      lowBpmStreak = 0;
+      lowBpmAlert = false;
+    }
+  }
+
+  // Evaluar SpO2 < 90% -> ID 3 (SpO2), Severidad 5
+  if (validSPO2 && spo2 > 70 && spo2 <= 100) {
+    if (spo2 < SPO2_MIN_ALERTA) {
+      if (lowSpo2Streak < 3) lowSpo2Streak++;
+      if (lowSpo2Streak >= 3 && !lowSpo2Alert) {
+        lowSpo2Alert = true;
+        registrarEventoBD(ID_SENSOR_SPO2, (float)spo2, SEV_OXIGENO_BAJO, "Oxigenacion deficiente (< 90%)", true);
+      }
+    } else {
+      lowSpo2Streak = 0;
+      lowSpo2Alert = false;
+    }
+  }
+}
+
+void actualizarMAX30102() {
+  particleSensor.check();
+  while (particleSensor.available()) {
+    uint32_t red = particleSensor.getRed();
+    uint32_t ir = particleSensor.getIR();
+    particleSensor.nextSample();
+
+    if (samplesInBuffer < BUFFER_SIZE) {
+      redBuffer[samplesInBuffer] = red;
+      irBuffer[samplesInBuffer] = ir;
+      samplesInBuffer++;
+
+      if (samplesInBuffer == BUFFER_SIZE) {
+        maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_SIZE, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+        evaluarAlertasOximetro();
+      }
+    } else {
+      newRed[newSampleCount] = red;
+      newIR[newSampleCount] = ir;
+      newSampleCount++;
+
+      if (newSampleCount == 25) {
+        for (byte i = 25; i < BUFFER_SIZE; i++) {
+          redBuffer[i - 25] = redBuffer[i];
+          irBuffer[i - 25] = irBuffer[i];
+        }
+        for (byte i = 0; i < 25; i++) {
+          redBuffer[75 + i] = newRed[i];
+          irBuffer[75 + i] = newIR[i];
+        }
+        newSampleCount = 0;
+
+        maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_SIZE, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+        evaluarAlertasOximetro();
+      }
+    }
+  }
+}
+
+void evaluarTemperaturaCorporal() {
+  sensors_event_t temp_tmp;
+  if (!tmp117.getEvent(&temp_tmp)) return;
+
+  bodyTemp = temp_tmp.temperature + TEMP_OFFSET;
+
+  TempStatus nextState = currentTempState;
+
+  if (bodyTemp < TEMP_HIPOTERMIA) {
+    nextState = TEMP_HIPOTERMIA_STATE;
+  } else if (bodyTemp > TEMP_EMERGENCIA) {
+    nextState = TEMP_EMERGENCIA_STATE;
+  } else if (bodyTemp >= TEMP_FIEBRE) {
+    nextState = TEMP_FIEBRE_STATE;
+  } else if (bodyTemp >= TEMP_VIGILANCIA) {
+    if (currentTempState == TEMP_FIEBRE_STATE && bodyTemp >= (TEMP_FIEBRE - TEMP_HISTERESIS)) {
+      nextState = TEMP_FIEBRE_STATE;
+    } else {
+      nextState = TEMP_VIGILANCIA_STATE;
+    }
+  } else {
+    if (currentTempState == TEMP_HIPOTERMIA_STATE && bodyTemp < (TEMP_HIPOTERMIA + TEMP_HISTERESIS)) {
+      nextState = TEMP_HIPOTERMIA_STATE;
+    } else if (currentTempState == TEMP_VIGILANCIA_STATE && bodyTemp >= (TEMP_VIGILANCIA - TEMP_HISTERESIS)) {
+      nextState = TEMP_VIGILANCIA_STATE;
+    } else {
+      nextState = TEMP_NORMAL_STATE;
+    }
+  }
+
+  currentTempState = nextState;
+
+  if (currentTempState != prevTempState) {
+    prevTempState = currentTempState;
+    switch (currentTempState) {
+      case TEMP_HIPOTERMIA_STATE:
+        registrarEventoBD(ID_SENSOR_TMP, bodyTemp, SEV_HIPOTERMIA, "Hipotermia detectada (< 30.5 C)", true);
+        break;
+      case TEMP_VIGILANCIA_STATE:
+        registrarEventoBD(ID_SENSOR_TMP, bodyTemp, SEV_VIGILANCIA, "Vigilancia termica (34.8 - 35.1 C)", true);
+        break;
+      case TEMP_FIEBRE_STATE:
+        registrarEventoBD(ID_SENSOR_TMP, bodyTemp, SEV_FIEBRE, "Fiebre detectada (>= 35.2 C)", true);
+        break;
+      case TEMP_EMERGENCIA_STATE:
+        registrarEventoBD(ID_SENSOR_TMP, bodyTemp, SEV_FIEBRE_CRITICA, "Fiebre critica (> 37.2 C)", true);
+        break;
+      case TEMP_NORMAL_STATE:
+        break;
+    }
+  }
+}
+
+// ==========================================
+// 11. SETUP Y LOOP PRINCIPAL
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== INICIANDO SISTEMA VITALINK ===");
+
+  // 1. Inicializar Bus I2C Hardware (Pines 4 y 5) para sensores
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+
+  // 2. Inicializar Sensores
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission() == 0) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1B); Wire.write(0x08);
+    Wire.endTransmission();
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1C); Wire.write(0x10);
+    Wire.endTransmission();
+    Serial.println("✔ MPU6050: Listo");
+  }
+
+  if (tmp117.begin()) {
+    Serial.println("✔ TMP117: Listo");
+    sensors_event_t temp_tmp;
+    if (tmp117.getEvent(&temp_tmp)) bodyTemp = temp_tmp.temperature + TEMP_OFFSET;
+  }
+
+  if (sht40.begin()) {
+    sht40.setPrecision(SHT4X_HIGH_PRECISION);
+    sht40.setHeater(SHT4X_NO_HEATER);
+    Serial.println("✔ SHT40: Listo");
+  }
+
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    particleSensor.setup(60, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x1F);
+    particleSensor.setPulseAmplitudeIR(0x1F);
+    Serial.println("✔ MAX30102: Listo");
+  }
+
+  // 3. Conectar Wi-Fi y sincronizar hora oficial de México (UTC-6)
+  Serial.print("Conectando a WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+
+  unsigned long inicioWifi = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicioWifi < 10000)) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✔ WiFi conectado.");
+    configTime(GMT_OFFSET_MEXICO_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
+    time_t now = time(nullptr);
+    unsigned long inicioNtp = millis();
+    while (now < 1600000000 && (millis() - inicioNtp < 8000)) {
+      delay(500);
+      now = time(nullptr);
+    }
+    Serial.print("✔ Hora México sincronizada: ");
+    Serial.println(obtenerFechaHoraMexico());
+  } else {
+    Serial.println("\n⚠ Sin WiFi inicial: operando en modo local.");
+  }
+
+  // 4. Inicializar Pantalla OLED DESPUÉS del Wi-Fi para evitar reinicio por pico de voltaje
+  u8g2.setBusClock(100000);
+  u8g2.begin();
+  u8g2.setPowerSave(0);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setFontPosTop();
+  Serial.println("✔ Pantalla OLED: Lista en GPIO 0 y 1");
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setBufferSize(512);
+
+  lastDbSendTime = millis();
+  mostrarVistaNormal();
+
+  // Verificar humedad inicial
+  sensors_event_t humidity, temp_sht;
+  if (sht40.getEvent(&humidity, &temp_sht)) {
+    ambientHumidity = humidity.relative_humidity;
+    ambientTemp = temp_sht.temperature;
+    if (ambientHumidity < HUMEDAD_ACTIVACION) {
+      enterLowPowerMode();
+    }
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Mantener enlace MQTT activo sin bloquear sensores
+  mantenerConexionMQTT(now);
+
+  // --- MODO AHORRO DE ENERGÍA ---
+  if (lowPowerMode) {
+    if (now - lastSleepCheck >= 2000) {
+      lastSleepCheck = now;
+
+      sensors_event_t humidity, temp_sht;
+      if (sht40.getEvent(&humidity, &temp_sht)) {
+        ambientHumidity = humidity.relative_humidity;
+        ambientTemp = temp_sht.temperature;
+
+        if (ambientHumidity >= HUMEDAD_ACTIVACION) {
+          exitLowPowerMode();
+        }
+      }
+    }
+    return;
+  }
+
+  // --- MODO ACTIVO COMPLETO ---
+  // 1. Muestreo rápido MPU6050 (50 Hz)
+  if (now - lastMpuSample >= 20) {
+    lastMpuSample = now;
+    actualizarMPU(now);
+  }
+
+  // 2. Muestreo continuo MAX30102
+  actualizarMAX30102();
+
+  // 3. Muestreo interno, refresco OLED y envío LIVE cada 1 segundo
+  if (now - lastSlowPoll >= 1000) {
+    lastSlowPoll = now;
+
+    sensors_event_t humidity, temp_sht;
+    if (sht40.getEvent(&humidity, &temp_sht)) {
+      ambientHumidity = humidity.relative_humidity;
+      ambientTemp = temp_sht.temperature;
+
+      if (ambientHumidity < HUMEDAD_ACTIVACION) {
+        enterLowPowerMode();
+        return;
+      }
+    }
+
+    evaluarTemperaturaCorporal();
+
+    // Acumular muestras ambientales y corporales del ciclo BD
+    sumBodyTemp += bodyTemp;
+    sumAmbientTemp += ambientTemp;
+    sumHumidity += ambientHumidity;
+    envSamples++;
+
+    // Acumular muestras cardíacas del ciclo BD
+    if (fingerDetected) {
+      if (validHeartRate && heartRate >= 30 && heartRate < 180) {
+        sumBpm += heartRate;
+        bpmSamples++;
+      }
+      if (validSPO2 && spo2 > 70 && spo2 <= 100) {
+        sumSpo2 += spo2;
+        spo2Samples++;
+      }
+    }
+
+    // Enviar datos crudos en vivo al servidor (BPM y SpO2 solo si > 0)
+    enviarDatosLive();
+
+    // Actualizar pantalla OLED
+    actualizarPantalla();
+  }
+
+  // 4. Envío periódico BD cada 1.5 minutos a vitalink/recv
+  if (now - lastDbSendTime >= DB_SEND_INTERVAL) {
+    registrarEventoBD(0, 0.0, 0, "CICLO COMPLETADO", false);
+  }
+}
